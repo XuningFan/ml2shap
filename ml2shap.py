@@ -58,6 +58,12 @@ from sklearn.naive_bayes import GaussianNB
 from sklearn.feature_selection import RFECV
 from joblib import Parallel, delayed
 
+
+# === Added for imbalance handling (SMOTETomek) ===
+from imblearn.combine import SMOTETomek
+from imblearn.over_sampling import SMOTE
+from imblearn.under_sampling import TomekLinks
+from imblearn.pipeline import Pipeline as ImbPipeline
 # SHAP
 import matplotlib
 matplotlib.use("Agg")
@@ -81,19 +87,19 @@ try:
     from xgboost import XGBClassifier
     HAVE_XGB = True
 except Exception:
-    pass
+        pass
 
 try:
     from lightgbm import LGBMClassifier
     HAVE_LGBM = True
 except Exception:
-    pass
+        pass
 
 try:
     from catboost import CatBoostClassifier
     HAVE_CAT = True
 except Exception:
-    pass
+        pass
 
 # =========================
 # Logging
@@ -533,52 +539,64 @@ def plot_roc_with_ci(y_true, y_score, model_name, outdir, ci_tuple=None):
     import matplotlib.pyplot as _plt
     from sklearn.metrics import roc_curve, roc_auc_score
     os.makedirs(outdir, exist_ok=True)
-
+    
+    ROC_COLOR_PALETTE = [
+    "#5566BE",  # 蓝
+    "#C85365",  # 绯红
+    "#E0B7B5",  # 浅橙粉
+    "#DFCDBC",  # 米杏
+    "#7CADCD",  # 浅天蓝
+    "#B4AFD1",  # 薰衣草紫
+    ]
     score = y_score
     if score is None:
         return
-    if score.ndim == 2 and score.shape[1] >= 2:
-        score = score[:,1]
+    if hasattr(score, "ndim") and score.ndim == 2 and score.shape[1] >= 2:
+        score = score[:, 1]
 
     fpr, tpr, thr = roc_curve(y_true, score)
     auc_val = roc_auc_score(y_true, score)
-    if ci_tuple is None or any([c!=c for c in ci_tuple]):
-        # compute if not provided
+
+    # Choose a random color from palette (deterministic by model name for stability)
+    rng = _np.random.default_rng(abs(hash(model_name)) % (2**32))
+    _color = rng.choice(ROC_COLOR_PALETTE)
+
+    # CI
+    if ci_tuple is None or any([c != c for c in ci_tuple]):
         auc_val, lo, hi = _bootstrap_auc_ci(y_true, score, n_boot=1000, alpha=0.05, random_state=42)
     else:
         lo, hi = ci_tuple[0], ci_tuple[1]
 
-    # find optimal point
+    # find optimal point (Youden J)
     j = tpr - fpr
     k = int(_np.nanargmax(j))
     fpr_star, tpr_star = fpr[k], tpr[k]
 
-    _plt.figure(figsize=(4,4), dpi=180)
-    _plt.plot(fpr, tpr, linewidth=2)
-    _plt.fill_between(fpr, _np.maximum.accumulate(tpr*0), tpr, alpha=0.08)
-    _plt.plot([0,1],[0,1],'--', linewidth=1)
-    _plt.scatter([fpr_star],[tpr_star], s=40, color='red', zorder=3)
-    _plt.text(fpr_star, tpr_star, f"  (FPR={fpr_star:.3f}, TPR={tpr_star:.3f})", fontsize=8, va='bottom')
+    _plt.figure(figsize=(4, 4), dpi=180)
+    _plt.plot(fpr, tpr, linewidth=2, color=_color)
+    _plt.fill_between(fpr, _np.maximum.accumulate(tpr*0), tpr, alpha=0.12, color=_color)
+    _plt.plot([0, 1], [0, 1], '--', linewidth=1)
+    _plt.scatter([fpr_star], [tpr_star], s=40, color='red', zorder=3)
 
     _plt.title(model_name)
     _plt.xlabel("False Positive Rate")
     _plt.ylabel("True Positive Rate")
 
+    # AUC/CI text (no legend box)
     legend_text = f"AUC = {auc_val:.3f}\n95% CI: [{lo:.3f}, {hi:.3f}]"
-    _plt.legend([legend_text, None, None], loc="lower right", frameon=True).remove()  # we'll place text box instead
-    # Use a text box for the legend-like stats
-    _plt.gca().text(0.62, 0.06, legend_text, fontsize=8,
-                    bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8))
+    _ax = _plt.gca()
+    _ax.text(0.98, 0.08, legend_text, fontsize=8, ha='right', va='bottom', transform=_ax.transAxes)
+
+    # Optimal point text below the AUC box
+    _ax.text(0.98, 0.02, f"Optimal point (FPR={fpr_star:.3f}, TPR={tpr_star:.3f})",
+             fontsize=8, ha='right', va='bottom', transform=_ax.transAxes)
 
     _plt.tight_layout()
     outpath = os.path.join(outdir, f"{model_name.replace(' ', '_')}_roc.png")
     _plt.savefig(outpath)
+    _plt.clf()
     _plt.close()
 
-
-# =========================
-# Search and train
-# =========================
 def get_best_model(model, X, y, param_grid, threads: int) -> Any:
 
     jobs = min(threads, 8)
@@ -791,6 +809,10 @@ def parse_args():
     p.add_argument("--cpu-limit", type=int, default=CPU_LIMIT, help=f"CPU threads cap (default {CPU_LIMIT})")
     p.add_argument("--cpu-only", action="store_true", help="Force CPU-only (ignore GPU)")
     p.add_argument("--outdir", type=str, default="outputs", help="Base directory for all outputs (metrics, SHAP, etc.)")
+
+    p.add_argument("--use-smotetomek", action="store_true",
+               help="Enable SMOTETomek resampling inside CV folds to handle class imbalance")
+
     return p.parse_args()
 
 def main():
@@ -806,8 +828,41 @@ def main():
         logger.info("CPU mode (or forced CPU).")
 
     x , y = load_data(args.csv, args.target)
+
+    # Log class distribution
+    try:
+        import numpy as _np
+        _pos = int((_np.array(y) == 1).sum())
+        _neg = int((_np.array(y) == 0).sum())
+        _tot = int(len(y))
+        logger.info("Class distribution (test before split): pos=%d, neg=%d, pos_ratio=%.4f",
+                    _pos, _neg, (_pos / max(_tot, 1)))
+    except Exception:
+        pass
     models, grids = model_param_init(threads=threads, use_gpu=gpu_ok)
 
+
+    # === Optional: wrap estimators with SMOTETomek inside CV folds ===
+    if args.use_smotetomek:
+        smt = SMOTETomek(
+            smote=SMOTE(random_state=42, k_neighbors=5),
+            tomek=TomekLinks(n_jobs=1)
+        )
+        new_models = {}
+        new_grids = {}
+        for _name, _est in models.items():
+            # Wrap each estimator into an ImbPipeline: resample -> est
+            new_models[_name] = ImbPipeline([("resample", smt), ("est", _est)])
+        for _name, _grid in grids.items():
+            _ng = {}
+            for _k, _v in _grid.items():
+                # Prefix param keys to point into the inner estimator
+                _ng["est__" + _k] = _v
+            # Also expose a small search over SMOTE k_neighbors (optional)
+            _ng["resample__smote__k_neighbors"] = [3, 5, 7]
+            new_grids[_name] = _ng
+        models, grids = new_models, new_grids
+    logger.info("SMOTETomek enabled: wrapped %d models for resampling inside CV.", len(models))
     run_models = [m.strip() for m in args.models.split(",") if m.strip()]
     run_models = [m for m in run_models if m in models]
 
