@@ -58,17 +58,25 @@ from sklearn.naive_bayes import GaussianNB
 from sklearn.feature_selection import RFECV
 from joblib import Parallel, delayed
 
-
-# === Added for imbalance handling (SMOTETomek) ===
-from imblearn.combine import SMOTETomek
-from imblearn.over_sampling import SMOTE
-from imblearn.under_sampling import TomekLinks
-from imblearn.pipeline import Pipeline as ImbPipeline
 # SHAP
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import shap
+
+
+# === Added for imbalance handling (SMOTETomek) ===
+try:
+    from imblearn.combine import SMOTETomek
+    from imblearn.over_sampling import SMOTE
+    from imblearn.under_sampling import TomekLinks
+    from imblearn.pipeline import Pipeline as ImbPipeline
+except ImportError as e:
+    raise ImportError(
+        "需要安装 imbalanced-learn 才能使用 --use-smotetomek。\n"
+        "请先运行：pip install -U imbalanced-learn"
+    ) from e
+
 
 try:
     from threadpoolctl import threadpool_limits
@@ -87,19 +95,19 @@ try:
     from xgboost import XGBClassifier
     HAVE_XGB = True
 except Exception:
-        pass
+    pass
 
 try:
     from lightgbm import LGBMClassifier
     HAVE_LGBM = True
 except Exception:
-        pass
+    pass
 
 try:
     from catboost import CatBoostClassifier
     HAVE_CAT = True
 except Exception:
-        pass
+    pass
 
 # =========================
 # Logging
@@ -111,6 +119,9 @@ handler.setFormatter(fmt)
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
+
+# === Added: global toggle for SMOTETomek ===
+GLOBAL_USE_SMOTETOMEK = False
 # =========================
 # Device and thread helpers
 # =========================
@@ -226,13 +237,13 @@ def model_param_init(threads: int, use_gpu: bool) -> Tuple[Dict[str, Any], Dict[
     if HAVE_CAT:
         cat_extra = {}
         if use_gpu:
-            cat_extra.update(dict(task_type="GPU", devices="0", gpu_ram_part=0.9))
+            cat_extra.update(dict(task_type="GPU", devices="0", gpu_ram_part=0.5, border_count=32))
         else:
             cat_extra.update(dict(thread_count=1))
         models["CatBoost"] = CatBoostClassifier(verbose=0, random_state=42, **cat_extra)
         param_grids["CatBoost"] = {
             "iterations": [100, 200],
-            "depth": [4, 6, 10],
+            "depth": [4, 6],
             "learning_rate": [0.01, 0.1]
         }
     else:
@@ -597,8 +608,8 @@ def plot_roc_with_ci(y_true, y_score, model_name, outdir, ci_tuple=None):
     _plt.clf()
     _plt.close()
 
-def get_best_model(model, X, y, param_grid, threads: int) -> Any:
 
+def get_best_model(model, X, y, param_grid, threads: int) -> Any:
     jobs = min(threads, 8)
     if _uses_gpu(model):
         jobs = 1
@@ -606,18 +617,33 @@ def get_best_model(model, X, y, param_grid, threads: int) -> Any:
         "accuracy": "accuracy",
         "roc_auc": "roc_auc_ovr"
     }
+    # === Added: richer scoring for imbalance ===
+    scoring.update({
+        "average_precision": "average_precision",
+        "f1": "f1",
+    })
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     grid_search = GridSearchCV(
         estimator=model,
         param_grid=param_grid,
         scoring=scoring,
-        refit="roc_auc",
+        refit="roc_auc",  # default; may override below
         cv=cv,
         verbose=1,
         n_jobs=jobs,
         pre_dispatch="1*n_jobs",
         return_train_score=True
     )
+    # === Added: set refit to PR AUC when SMOTETomek is enabled ===
+    try:
+        if GLOBAL_USE_SMOTETOMEK:
+            grid_search.set_params(scoring=scoring, refit="average_precision")
+            logger.info("Refit metric set to average_precision (PR AUC) due to SMOTETomek.")
+        else:
+            grid_search.set_params(scoring=scoring)  # keep default refit in constructor
+    except Exception as _e:
+        logger.warning("Could not adjust refit to average_precision; keeping default. %s", _e)
+
     with limit_threads(threads):
         try:
             grid_search.fit(X, y)
@@ -805,13 +831,13 @@ def parse_args():
     p.add_argument("--csv", type=str, default="", help="CSV path (optional; synthetic data if omitted)")
     p.add_argument("--target", type=str, default="", help="Target column name (for CSV mode)")
     p.add_argument("--models", type=str, default="Logistic Regression,Random Forest,XGBoost,LightGBM,CatBoost,MLP,GaussianNB,AdaBoost,Stacking",
-                   help="Models to run, comma-separated. Default runs all.")
+    help="Models to run, comma-separated. Default runs all.")
     p.add_argument("--cpu-limit", type=int, default=CPU_LIMIT, help=f"CPU threads cap (default {CPU_LIMIT})")
     p.add_argument("--cpu-only", action="store_true", help="Force CPU-only (ignore GPU)")
     p.add_argument("--outdir", type=str, default="outputs", help="Base directory for all outputs (metrics, SHAP, etc.)")
 
     p.add_argument("--use-smotetomek", action="store_true",
-               help="Enable SMOTETomek resampling inside CV folds to handle class imbalance")
+    help="Enable SMOTETomek resampling inside CV folds (and refit on PR AUC/F1)")
 
     return p.parse_args()
 
@@ -828,19 +854,11 @@ def main():
         logger.info("CPU mode (or forced CPU).")
 
     x , y = load_data(args.csv, args.target)
-
-    # Log class distribution
-    try:
-        import numpy as _np
-        _pos = int((_np.array(y) == 1).sum())
-        _neg = int((_np.array(y) == 0).sum())
-        _tot = int(len(y))
-        logger.info("Class distribution (test before split): pos=%d, neg=%d, pos_ratio=%.4f",
-                    _pos, _neg, (_pos / max(_tot, 1)))
-    except Exception:
-        pass
     models, grids = model_param_init(threads=threads, use_gpu=gpu_ok)
 
+    # === Added: expose flag to module scope ===
+    global GLOBAL_USE_SMOTETOMEK
+    GLOBAL_USE_SMOTETOMEK = args.use_smotetomek
 
     # === Optional: wrap estimators with SMOTETomek inside CV folds ===
     if args.use_smotetomek:
@@ -851,18 +869,19 @@ def main():
         new_models = {}
         new_grids = {}
         for _name, _est in models.items():
-            # Wrap each estimator into an ImbPipeline: resample -> est
+            # Wrap: resample -> est
             new_models[_name] = ImbPipeline([("resample", smt), ("est", _est)])
         for _name, _grid in grids.items():
             _ng = {}
             for _k, _v in _grid.items():
-                # Prefix param keys to point into the inner estimator
                 _ng["est__" + _k] = _v
-            # Also expose a small search over SMOTE k_neighbors (optional)
+            # Tune SMOTE neighbors and sampling ratio (milder than 1:1)
             _ng["resample__smote__k_neighbors"] = [3, 5, 7]
+            _ng["resample__sampling_strategy"] = [0.5, 0.7, "auto"]
             new_grids[_name] = _ng
-        models, grids = new_models, new_grids
-    logger.info("SMOTETomek enabled: wrapped %d models for resampling inside CV.", len(models))
+            logger.info("SMOTETomek enabled: models wrapped for in-fold resampling; PR-oriented refit will be used.")
+            models, grids = new_models, new_grids
+
     run_models = [m.strip() for m in args.models.split(",") if m.strip()]
     run_models = [m for m in run_models if m in models]
 
