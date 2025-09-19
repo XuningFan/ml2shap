@@ -49,6 +49,8 @@ from sklearn.metrics import (
 )
 from sklearn.metrics import make_scorer
 from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.linear_model import LogisticRegression, Lasso, ElasticNet
 from sklearn.ensemble import RandomForestClassifier, AdaBoostClassifier, StackingClassifier
@@ -118,6 +120,17 @@ fmt = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", "%Y-%m-%d %
 handler.setFormatter(fmt)
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)
+
+# === Auto-preprocess globals ===
+GLOBAL_AUTO_PREPROCESS = False
+GLOBAL_PREPROCESS_LINEAR = None   # ColumnTransformer for Logistic/MLP
+GLOBAL_PREPROCESS_TREE = None     # ColumnTransformer for tree-based models
+
+# === Auto-preprocess configs (new) ===
+AUTO_CAT_MAX_UNIQUE = 20      # 整数列若唯一值 ≤ 该阈值，则视为“无序类别”
+AUTO_CAT_HINTS = set()        # 人工指定“这些列按类别处理”
+AUTO_NUM_HINTS = set()        # 人工指定“这些列按数值处理”
+
 
 
 # === Added: global toggle for SMOTETomek ===
@@ -809,6 +822,89 @@ def train_and_evaluate(
         json.dump(dfm.to_dict(orient="records"), f, ensure_ascii=False, indent=2)
     logger.info("Saved metrics summary to: %s", csv_path)
 
+
+import pandas as _pd
+import numpy as _np
+from pandas.api.types import is_integer_dtype, is_float_dtype, is_bool_dtype
+
+def _is_int_like_series(s: _pd.Series) -> bool:
+    if is_integer_dtype(s) or is_bool_dtype(s):
+        return True
+    if is_float_dtype(s):
+        v = s.dropna().values
+        if v.size == 0:
+            return False
+        return _np.allclose(v, _np.round(v))
+    return False
+
+def _infer_feature_types(
+    X: _pd.DataFrame,
+    max_unique: int = AUTO_CAT_MAX_UNIQUE,
+    cat_hints: set = None,
+    num_hints: set = None,
+):
+    cat_hints = set() if cat_hints is None else set(cat_hints)
+    num_hints = set() if num_hints is None else set(num_hints)
+
+    cat_cols = []
+    num_cols = []
+
+    for c in X.columns:
+        if c in num_hints:
+            num_cols.append(c)
+            continue
+        if c in cat_hints:
+            cat_cols.append(c)
+            continue
+
+        s = X[c]
+        dt = str(s.dtype)
+
+        if dt in ("object", "category") or is_bool_dtype(s):
+            cat_cols.append(c)
+            continue
+
+        if _is_int_like_series(s):
+            nunq = s.nunique(dropna=True)
+            if nunq <= max_unique:
+                cat_cols.append(c)
+            else:
+                num_cols.append(c)
+            continue
+
+        num_cols.append(c)
+
+    return num_cols, cat_cols
+
+def _build_preprocessors(X: _pd.DataFrame):
+    from sklearn.preprocessing import StandardScaler
+    num_cols, cat_cols = _infer_feature_types(
+        X, max_unique=AUTO_CAT_MAX_UNIQUE,
+        cat_hints=AUTO_CAT_HINTS,
+        num_hints=AUTO_NUM_HINTS,
+    )
+
+    ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=True)
+
+    pre_linear = ColumnTransformer(
+        transformers=[
+            ("num", StandardScaler(with_mean=False), num_cols),
+            ("cat", ohe, cat_cols),
+        ],
+        remainder="drop",
+        sparse_threshold=1.0,
+    )
+
+    pre_tree = ColumnTransformer(
+        transformers=[
+            ("num", "passthrough", num_cols),
+            ("cat", ohe, cat_cols),
+        ],
+        remainder="drop",
+        sparse_threshold=1.0,
+    )
+    return pre_linear, pre_tree
+
 # =========================
 # Data loading
 # =========================
@@ -831,14 +927,20 @@ def parse_args():
     p.add_argument("--csv", type=str, default="", help="CSV path (optional; synthetic data if omitted)")
     p.add_argument("--target", type=str, default="", help="Target column name (for CSV mode)")
     p.add_argument("--models", type=str, default="Logistic Regression,Random Forest,XGBoost,LightGBM,CatBoost,MLP,GaussianNB,AdaBoost,Stacking",
-    help="Models to run, comma-separated. Default runs all.")
+                    help="Models to run, comma-separated. Default runs all.")
     p.add_argument("--cpu-limit", type=int, default=CPU_LIMIT, help=f"CPU threads cap (default {CPU_LIMIT})")
     p.add_argument("--cpu-only", action="store_true", help="Force CPU-only (ignore GPU)")
     p.add_argument("--outdir", type=str, default="outputs", help="Base directory for all outputs (metrics, SHAP, etc.)")
-
     p.add_argument("--use-smotetomek", action="store_true",
-    help="Enable SMOTETomek resampling inside CV folds (and refit on PR AUC/F1)")
-
+                    help="Enable SMOTETomek resampling inside CV folds (and refit on PR AUC/F1)")
+    p.add_argument("--auto-preprocess", action="store_true",
+                   help="自动区分数值/类别列：线性/MLP做标准化+OneHot，树模型做OneHot。默认关闭。")
+    p.add_argument("--auto-categorical-max-unique", type=int, default=20,
+                   help="整数风格列若唯一值数 ≤ 该阈值，则视为类别（默认 20）。仅在 --auto-preprocess 开启时生效。")
+    p.add_argument("--categorical-hints", type=str, default="",
+                   help="逗号分隔列名，这些列强制按类别处理（优先级低于 numeric-hints）。")
+    p.add_argument("--numeric-hints", type=str, default="",
+                   help="逗号分隔列名，这些列强制按数值处理（优先级高于 categorical-hints）。")
     return p.parse_args()
 
 def main():
@@ -854,6 +956,24 @@ def main():
         logger.info("CPU mode (or forced CPU).")
 
     x , y = load_data(args.csv, args.target)
+
+    # === Auto-preprocess setup ===
+    global GLOBAL_AUTO_PREPROCESS, GLOBAL_PREPROCESS_LINEAR, GLOBAL_PREPROCESS_TREE
+    GLOBAL_AUTO_PREPROCESS = args.auto_preprocess
+
+    global AUTO_CAT_MAX_UNIQUE, AUTO_CAT_HINTS, AUTO_NUM_HINTS
+    AUTO_CAT_MAX_UNIQUE = max(2, int(getattr(args, "auto_categorical_max_unique", 20)))
+    AUTO_CAT_HINTS = set([c.strip() for c in getattr(args, "categorical_hints", "").split(",") if c.strip()])
+    AUTO_NUM_HINTS = set([c.strip() for c in getattr(args, "numeric_hints", "").split(",") if c.strip()])
+
+    if GLOBAL_AUTO_PREPROCESS:
+        GLOBAL_PREPROCESS_LINEAR, GLOBAL_PREPROCESS_TREE = _build_preprocessors(x)
+        logger.info(
+            "Auto-preprocess enabled | int-like as categorical if unique <= %d | cat_hints=%s | num_hints=%s",
+            AUTO_CAT_MAX_UNIQUE, sorted(list(AUTO_CAT_HINTS)) if AUTO_CAT_HINTS else [],
+            sorted(list(AUTO_NUM_HINTS)) if AUTO_NUM_HINTS else []
+        )
+
     models, grids = model_param_init(threads=threads, use_gpu=gpu_ok)
 
     # === Added: expose flag to module scope ===
