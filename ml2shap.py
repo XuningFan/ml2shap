@@ -16,6 +16,7 @@ import argparse
 import logging
 from contextlib import contextmanager
 from typing import Dict, Tuple, Any, List
+import importlib
 
 # =========================
 # Global resource limits (set before heavy imports)
@@ -472,6 +473,74 @@ def shap_explain_and_save(model, X_train, X_test, feature_names, outdir, model_n
 
     logger.info("Saved SHAP plots and importance to: %s", outdir)
 
+
+# =========================
+# JSON-safe serializer for estimator params
+# =========================
+def _json_sanitize(obj):
+    """
+    Recursively convert sklearn/numpy objects into JSON-serializable forms.
+    - Estimators -> {"_estimator": "module.Class", "_params": shallow params}
+    - numpy scalars/arrays -> python scalars/lists
+    - callables/other -> str(obj)
+    """
+    try:
+        import numpy as _np
+    except Exception:
+        _np = None
+    try:
+        from sklearn.base import BaseEstimator as _BaseEstimator
+    except Exception:
+        class _BaseEstimator:  # fallback
+            pass
+
+    # primitives
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+
+    # numpy scalars
+    if _np is not None and isinstance(obj, (_np.generic,)):
+        try:
+            return obj.item()
+        except Exception:
+            return str(obj)
+
+    # list/tuple/set
+    if isinstance(obj, (list, tuple, set)):
+        return [_json_sanitize(v) for v in obj]
+
+    # dict-like
+    if isinstance(obj, dict):
+        return {str(k): _json_sanitize(v) for k, v in obj.items()}
+
+    # numpy arrays
+    if _np is not None and isinstance(obj, _np.ndarray):
+        try:
+            return obj.tolist()
+        except Exception:
+            return str(obj)
+
+    # sklearn estimators
+    try:
+        if isinstance(obj, _BaseEstimator):
+            cls = obj.__class__
+            mod = getattr(cls, "__module__", "")
+            name = getattr(cls, "__name__", str(cls))
+            # shallow params to avoid huge nested graphs
+            try:
+                shallow = obj.get_params(deep=False)
+            except Exception:
+                shallow = {}
+            return {"_estimator": f"{mod}.{name}", "_params": _json_sanitize(shallow)}
+    except Exception:
+        pass
+
+    # fallback
+    try:
+        return str(obj)
+    except Exception:
+        return "<unserializable>"
+
 # =========================
 # Metrics helpers
 # =========================
@@ -807,7 +876,7 @@ def train_and_evaluate(
                 best_params = {"_warning": f"could not extract params: {type(_e).__name__}: {_e}"}
             try:
                 with open(params_out, "w", encoding="utf-8") as _pf:
-                    json.dump(best_params, _pf, ensure_ascii=False, indent=2)
+                    json.dump(_json_sanitize(best_params), _pf, ensure_ascii=False, indent=2)
                 _log(f"Saved best params for {name} -> {params_out}")
             except Exception as _e:
                 _log(f"Failed to save best params for {name}: {type(_e).__name__}: {_e}")
@@ -905,9 +974,65 @@ def _build_preprocessors(X: _pd.DataFrame):
     )
     return pre_linear, pre_tree
 
+
 # =========================
-# Data loading
+# External model config loader (append-only; does not alter built-ins)
 # =========================
+def _resolve_estimator(class_path: str, kwargs: dict):
+    """Resolve an import path like "sklearn.svm.SVC" and instantiate with kwargs."""
+    if not class_path or "." not in class_path:
+        raise ValueError(f"Invalid estimator path: {class_path}")
+    module_name, cls_name = class_path.rsplit(".", 1)
+    mod = importlib.import_module(module_name)
+    cls = getattr(mod, cls_name)
+    return cls(**(kwargs or {}))
+
+
+def _append_models_from_config(models: Dict[str, Any],
+                               grids: Dict[str, Dict[str, List[Any]]],
+                               config_path: str) -> Tuple[Dict[str, Any], Dict[str, Dict[str, List[Any]]]]:
+    """
+    Read JSON file and append new models to existing dicts.
+
+    Schema example:
+    {
+      "models": [
+        {
+          "name": "SVC",
+          "estimator": "sklearn.svm.SVC",
+          "params": {"probability": true},
+          "grid": {"C": [0.1, 1, 10], "kernel": ["rbf", "linear"]}
+        }
+      ]
+    }
+
+    Notes:
+      - We do NOT wrap/alter estimators; they are appended as given.
+      - Grid keys are used as-is; they will be auto-prefixed with "est__" later
+        when SMOTETomek wrapping occurs (existing logic already handles this).
+    """
+    import json as _json
+    with open(config_path, "r", encoding="utf-8") as f:
+        cfg = _json.load(f)
+    items = cfg.get("models", [])
+    for m in items:
+        name = m.get("name")
+        est_path = m.get("estimator")
+        if not name or not est_path:
+            continue
+        params = m.get("params", {})
+        grid = m.get("grid", {}) or {}
+        est = _resolve_estimator(est_path, params)
+        # ensure unique name if conflict
+        add = name
+        k = 1
+        while add in models:
+            k += 1
+            add = f"{name}*{k}"
+        models[add] = est
+        grids[add] = grid
+    return models, grids
+
 def load_data(csv_path: str = "", target_col: str = "") -> Tuple[pd.DataFrame, np.ndarray]:
     """Load CSV, preserve original column names exactly; if target_col not given, use last column."""
     df = pd.read_csv(csv_path)
@@ -941,6 +1066,7 @@ def parse_args():
                    help="逗号分隔列名，这些列强制按类别处理（优先级低于 numeric-hints）。")
     p.add_argument("--numeric-hints", type=str, default="",
                    help="逗号分隔列名，这些列强制按数值处理（优先级高于 categorical-hints）。")
+    p.add_argument("--model-config", type=str, default="", help="JSON 配置文件路径（可选）：追加外部模型与网格，不改变内置模型）")
     return p.parse_args()
 
 def main():
@@ -976,10 +1102,17 @@ def main():
 
     models, grids = model_param_init(threads=threads, use_gpu=gpu_ok)
 
+    # Append external models if a config file is provided (append-only; keep built-ins intact)
+    if getattr(args, "model_config", ""):
+        try:
+            models, grids = _append_models_from_config(models, grids, args.model_config)
+            logger.info("External models appended from %s. Total models now: %d", args.model_config, len(models))
+        except Exception as _e:
+            logger.error("Failed to load external model config: %s", _e)
+
     # === Added: expose flag to module scope ===
     global GLOBAL_USE_SMOTETOMEK
     GLOBAL_USE_SMOTETOMEK = args.use_smotetomek
-
     # === Optional: wrap estimators with SMOTETomek inside CV folds ===
     if args.use_smotetomek:
         smt = SMOTETomek(
@@ -1001,10 +1134,9 @@ def main():
             new_grids[_name] = _ng
             logger.info("SMOTETomek enabled: models wrapped for in-fold resampling; PR-oriented refit will be used.")
             models, grids = new_models, new_grids
-
     run_models = [m.strip() for m in args.models.split(",") if m.strip()]
     run_models = [m for m in run_models if m in models]
-
+    
     logger.info("Models to train: %s", ", ".join(run_models))
     logger.info("CPU threads cap: %d", threads)
 

@@ -1,0 +1,57 @@
+{
+  "models": [
+    {
+      "name": "SVC",
+      "estimator": "sklearn.svm.SVC",
+      "params": {
+        "probability": true,
+        "random_state": 42
+      },
+      "grid": {
+        "C": [
+          0.1,
+          1,
+          10
+        ],
+        "kernel": [
+          "rbf",
+          "linear"
+        ]
+      }
+    },
+    {
+      "name": "KNN",
+      "estimator": "sklearn.neighbors.KNeighborsClassifier",
+      "params": {},
+      "grid": {
+        "n_neighbors": [
+          3,
+          5,
+          7
+        ],
+        "weights": [
+          "uniform",
+          "distance"
+        ]
+      }
+    },
+    {
+      "name": "ExtraTrees",
+      "estimator": "sklearn.ensemble.ExtraTreesClassifier",
+      "params": {
+        "random_state": 42
+      },
+      "grid": {
+        "n_estimators": [
+          100,
+          200
+        ],
+        "max_depth": [
+          null,
+          10,
+          20
+        ]
+      }
+    }
+  ]
+}
