@@ -751,6 +751,59 @@ def get_best_model(model, X, y, param_grid, threads: int) -> Any:
     logger.info("CV Accuracy max: %.4f | AUROC max: %.4f", mean_acc, mean_auc)
     return grid_search.best_estimator_
 
+
+def save_misclassified(X_test, y_test, y_pred, y_score, name, outdir, logs_dir, _log):
+    try:
+        # indices in the test set where prediction is wrong
+        mis_idx = np.where(y_pred != y_test)[0]
+        mis_global_idx = X_test.index[mis_idx]
+
+        # Build output DataFrame with original (untransformed) feature values
+        df_err = X_test.loc[mis_global_idx].copy()
+        df_err.insert(0, "sample_index", mis_global_idx)
+        df_err["y_true"] = y_test[mis_idx]
+        df_err["y_pred"] = y_pred[mis_idx]
+
+        # Attach model scores if available
+        if y_score is not None:
+            if hasattr(y_score, "ndim") and y_score.ndim == 2 and y_score.shape[1] >= 2:
+                try:
+                    df_err["score_pos"] = y_score[mis_idx, 1]
+                except Exception:
+                    df_err["score_pos"] = y_score[mis_idx]
+            else:
+                df_err["score_pos"] = y_score[mis_idx]
+
+        # Save per-model misclassified CSV
+        mis_dir = os.path.join(outdir, "misclassified")
+        os.makedirs(mis_dir, exist_ok=True)
+        mis_out = os.path.join(mis_dir, f"{name.replace(' ', '_')}_misclassified_with_features.csv")
+        df_err.to_csv(mis_out, index=False)
+        _log(f"Saved misclassified samples with features for {name} -> {mis_out}")
+
+        # (optional) save ALL predictions for audit
+        df_all = X_test.copy()
+        df_all.insert(0, "sample_index", X_test.index)
+        df_all["y_true"] = y_test
+        df_all["y_pred"] = y_pred
+        if y_score is not None:
+            if hasattr(y_score, "ndim") and y_score.ndim == 2 and y_score.shape[1] >= 2:
+                try:
+                    df_all["score_pos"] = y_score[:, 1]
+                except Exception:
+                    df_all["score_pos"] = np.asarray(y_score).ravel()
+            else:
+                df_all["score_pos"] = np.asarray(y_score).ravel()
+        all_out = os.path.join(mis_dir, f"{name.replace(' ', '_')}_all_predictions_with_features.csv")
+        df_all.to_csv(all_out, index=False)
+        _log(f"Saved all predictions with features for {name} -> {all_out}")
+
+    except Exception as _e:
+        import logging
+        logger = logging.getLogger("batch")
+        logger.warning("Failed to save misclassified table for %s: %s", name, _e)
+
+
 def train_and_evaluate(
     X: pd.DataFrame,
     y: np.ndarray,
@@ -804,7 +857,8 @@ def train_and_evaluate(
             else:
                 y_score = None
             y_pred = best_model.predict(X_test)
-
+            # save wrong samples 
+            save_misclassified(X_test, y_test, y_pred, y_score, name, outdir, logs_dir, _log)
         # classification report logging
         logger.info("Confusion Matrix:\n%s", confusion_matrix(y_test, y_pred))
         logger.info("Classification Report:\n%s", classification_report(y_test, y_pred))
@@ -1144,3 +1198,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
