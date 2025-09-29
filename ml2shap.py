@@ -691,6 +691,109 @@ def plot_roc_with_ci(y_true, y_score, model_name, outdir, ci_tuple=None):
     _plt.close()
 
 
+
+# =========================
+# DCA (Decision Curve Analysis) helpers (added)
+# =========================
+def _dca_calculate_net_benefit_model(thresholds: np.ndarray, y_score: np.ndarray, y_true: np.ndarray) -> np.ndarray:
+    r"""
+    Compute model net benefit across thresholds.
+    NB(pt) = (TP/N) - (FP/N) * (pt/(1-pt))
+    r"""
+    y_true = np.asarray(y_true).astype(int)
+    N = max(1, y_true.size)
+    score = np.asarray(y_score).reshape(-1)
+    if score.ndim == 2 and score.shape[1] >= 2:
+        score = score[:, 1]
+    net_benefits = []
+    for pt in thresholds:
+        if pt <= 0 or pt >= 1:
+            net_benefits.append(0.0)
+            continue
+        y_pred = (score >= pt).astype(int)
+        tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+        nb = (tp / N) - (fp / N) * (pt / (1 - pt))
+        net_benefits.append(nb)
+    return np.array(net_benefits, dtype=float)
+
+
+def _dca_calculate_net_benefit_all(thresholds: np.ndarray, y_true: np.ndarray) -> np.ndarray:
+    r"""
+    Net benefit of 'treat all' strategy: prevalence - (1-prevalence)*(pt/(1-pt))
+    r"""
+    y_true = np.asarray(y_true).astype(int)
+    N = max(1, y_true.size)
+    prevalence = float(np.sum(y_true == 1)) / N
+    res = []
+    for pt in thresholds:
+        if pt <= 0 or pt >= 1:
+            res.append(0.0)
+            continue
+        nb_all = prevalence - (1.0 - prevalence) * (pt / (1.0 - pt))
+        res.append(nb_all)
+    return np.array(res, dtype=float)
+
+
+def _dca_plot(ax, thresholds, model_net_benefits, treat_all_net_benefits, title=None, model_label='model', color=None):
+    ax.plot(thresholds, model_net_benefits, linewidth=2, label=model_label, color=color if color else None)
+    ax.plot(thresholds, treat_all_net_benefits, color='black', label='ALL', linestyle='-', linewidth=1.5)
+    ax.plot((0, 1), (0, 0), color='black', linestyle=':', label='Treat none')
+    # Shade benefit over treat-all and 0
+    y2 = np.maximum(treat_all_net_benefits, 0)
+    y1 = np.maximum(model_net_benefits, y2)
+    try:
+        ax.fill_between(thresholds, y1, y2, alpha=0.2, color=color if color else None)
+    except Exception:
+        pass
+    ax.set_xlim(0, 1)
+    ax.set_ylim(min(model_net_benefits.min(), 0) - 0.05, model_net_benefits.max() + 0.05)
+    ax.set_xlabel('Threshold Probability', fontsize=12)
+    ax.set_ylabel('Net Benefit', fontsize=12)
+    ax.grid(True, linestyle='--', alpha=0.7)
+    ax.spines['right'].set_visible(False)
+    ax.spines['top'].set_visible(False)
+    ax.legend(loc='upper right', frameon=True)
+    if title:
+        ax.set_title(title, fontsize=14)
+    return ax
+
+
+def _run_dca_and_save(model_name: str, y_score, y_true, thresholds: np.ndarray, outdir: str):
+    try:
+        os.makedirs(outdir, exist_ok=True)
+    except Exception:
+        pass
+    nb_model = _dca_calculate_net_benefit_model(thresholds, y_score, y_true)
+    nb_all = _dca_calculate_net_benefit_all(thresholds, y_true)
+    opt_idx = int(np.nanargmax(nb_model))
+    opt_thr = float(thresholds[opt_idx])
+    opt_nb = float(nb_model[opt_idx])
+
+    # Plot
+    fig, ax = plt.subplots(figsize=(6.5, 4.2), dpi=180)
+    # deterministic color per model
+    palette = ["#5566BE","#C85365","#E0B7B5","#DFCDBC","#7CADCD","#B4AFD1"]
+    color = palette[abs(hash(model_name)) % len(palette)]
+    _dca_plot(ax, thresholds, nb_model, nb_all, title=f"{model_name} DCA", model_label=model_name, color=color)
+    ax.axvline(x=opt_thr, color='green', linestyle='--', alpha=0.8)
+    ax.text(opt_thr, ax.get_ylim()[1]*0.95, f"best cutoff: {opt_thr:.3f}", rotation=90, va='top', ha='left', fontsize=9)
+    fig.tight_layout()
+    png = os.path.join(outdir, f"{model_name.replace(' ', '_')}_dca.png")
+    fig.savefig(png, bbox_inches="tight")
+    plt.close(fig)
+
+    # JSON
+    out = {
+        "model": model_name,
+        "thresholds": [float(t) for t in thresholds],
+        "net_benefit_model": [float(x) for x in nb_model],
+        "net_benefit_treat_all": [float(x) for x in nb_all],
+        "optimal_threshold": opt_thr,
+        "max_net_benefit": opt_nb,
+    }
+    with open(os.path.join(outdir, f"{model_name.replace(' ', '_')}_dca.json"), "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=2)
+
 def get_best_model(model, X, y, param_grid, threads: int) -> Any:
     jobs = min(threads, 8)
     if _uses_gpu(model):
@@ -911,6 +1014,19 @@ def train_and_evaluate(
         except Exception as e:
             logger.warning("ROC plot failed for %s: %s", name, e)
 
+
+        # DCA curve (binary only; requires probabilities/scores)
+        try:
+            if bool(globals().get("_ARG_WITH_DCA", False)) and len(np.unique(y_test)) == 2 and y_score is not None:
+                dmin = float(globals().get("_ARG_DCA_MIN", 0.01))
+                dmax = float(globals().get("_ARG_DCA_MAX", 0.99))
+                dsteps = int(globals().get("_ARG_DCA_STEPS", 99))
+                dsteps = max(10, dsteps)
+                thresholds = np.linspace(dmin, dmax, dsteps)
+                dca_dir = os.path.join(outdir, "dca")
+                _run_dca_and_save(name, y_score, y_test, thresholds, dca_dir)
+        except Exception as e:
+            logger.warning("DCA plot failed for %s: %s", name, e)
         # SHAP explain
         try:
             feat_names = list(X.columns)
@@ -1121,10 +1237,18 @@ def parse_args():
     p.add_argument("--numeric-hints", type=str, default="",
                    help="逗号分隔列名，这些列强制按数值处理（优先级高于 categorical-hints）。")
     p.add_argument("--model-config", type=str, default="", help="JSON 配置文件路径（可选）：追加外部模型与网格，不改变内置模型）")
+    p.add_argument("--with-dca", action="store_true", help="开启 DCA 决策曲线分析（仅二分类有效）")
+    p.add_argument("--dca-steps", type=int, default=99, help="DCA 阈值步数（默认99，对应0.01~0.99）")
+    p.add_argument("--dca-min", type=float, default=0.01, help="DCA 阈值最小值（开区间，不含0）")
+    p.add_argument("--dca-max", type=float, default=0.99, help="DCA 阈值最大值（开区间，不含1）")
     return p.parse_args()
 
 def main():
     args = parse_args()
+    globals()["_ARG_WITH_DCA"] = bool(getattr(args, "with_dca", False))
+    globals()["_ARG_DCA_STEPS"] = int(getattr(args, "dca_steps", 99))
+    globals()["_ARG_DCA_MIN"] = float(getattr(args, "dca_min", 0.01))
+    globals()["_ARG_DCA_MAX"] = float(getattr(args, "dca_max", 0.99))
     threads = _coerce_cpu_limit(str(args.cpu_limit))
 
     gpu_ok = (not args.cpu_only) and have_torch_cuda()
